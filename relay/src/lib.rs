@@ -1,7 +1,7 @@
 use std::{
     fmt::{Display, Formatter},
     net::SocketAddr,
-    path::Path,
+    path::Path as FsPath,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -53,7 +53,7 @@ impl AppState {
     }
 
     pub fn new_at_path(path: &str) -> Result<Self, AppError> {
-        if let Some(parent) = Path::new(path).parent() {
+        if let Some(parent) = FsPath::new(path).parent() {
             std::fs::create_dir_all(parent).map_err(AppError::internal)?;
         }
         let conn = Connection::open(path).map_err(AppError::internal)?;
@@ -366,6 +366,7 @@ async fn get_peers(State(state): State<AppState>) -> Result<Json<PeerList>, AppE
     Ok(Json(PeerList { peers }))
 }
 
+#[derive(Debug)]
 struct ValidatedBundle {
     object_id: String,
     payload: String,
@@ -485,12 +486,13 @@ impl ValidatedPeerAnnouncement {
             verify_signature(&public_key_bytes, &bytes, &signature_bytes)?;
         }
         let payload = serde_json::to_string(&peer).map_err(AppError::internal)?;
+        let expires_epoch = peer.expires_epoch;
         Ok(Self {
             peer,
             payload,
             node_id,
             last_seen_epoch: now_epoch(),
-            expires_epoch: peer.expires_epoch,
+            expires_epoch,
         })
     }
 }
