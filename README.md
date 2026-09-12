@@ -19,6 +19,8 @@ The relay exposes:
 
 - `POST /v1/bundles`
 - `GET /v1/bundles/random?count=N`
+- `GET /v1/inventory/recent?limit=N`
+- `POST /v1/inventory/missing`
 - `GET /v1/objects/{hash}`
 - `POST /v1/announce`
 - `GET /v1/peers`

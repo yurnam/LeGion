@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::{Display, Formatter},
     net::SocketAddr,
     path::Path as FsPath,
@@ -37,6 +38,7 @@ pub const MAX_SIGNATURE_HEX_LENGTH: usize = 160;
 pub const MAX_VENDOR_IE_DIGEST_BYTES: usize = 64;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PEER_STALENESS_SECS: u64 = 60 * 60 * 24 * 7;
+pub const MAX_INVENTORY_OBJECT_IDS: usize = 256;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -68,6 +70,8 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/bundles", post(post_bundle))
         .route("/v1/bundles/random", get(get_random_bundles))
+        .route("/v1/inventory/recent", get(get_recent_inventory))
+        .route("/v1/inventory/missing", post(post_inventory_missing))
         .route("/v1/objects/{hash}", get(get_object))
         .route("/v1/announce", post(post_announce))
         .route("/v1/peers", get(get_peers))
@@ -241,6 +245,27 @@ pub struct RandomBundlesQuery {
     count: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RecentInventoryQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RecentInventoryResponse {
+    pub object_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InventoryMissingRequest {
+    pub object_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InventoryMissingResponse {
+    pub needed_object_ids: Vec<String>,
+}
+
 async fn post_bundle(
     State(state): State<AppState>,
     Json(bundle): Json<BeaconBundle>,
@@ -294,6 +319,61 @@ async fn get_random_bundles(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(bundles))
+}
+
+async fn get_recent_inventory(
+    State(state): State<AppState>,
+    Query(query): Query<RecentInventoryQuery>,
+) -> Result<Json<RecentInventoryResponse>, AppError> {
+    let limit = query.limit.unwrap_or(32).clamp(1, MAX_INVENTORY_OBJECT_IDS);
+    let now = now_epoch();
+    let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT object_id FROM bundles
+             WHERE expires_epoch > ?1
+             ORDER BY created_epoch DESC, object_id ASC
+             LIMIT ?2",
+        )
+        .map_err(AppError::internal)?;
+    let rows = stmt
+        .query_map(params![now as i64, limit as i64], |row| row.get::<_, String>(0))
+        .map_err(AppError::internal)?;
+    let object_ids = rows
+        .map(|row| row.map_err(AppError::internal))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(RecentInventoryResponse { object_ids }))
+}
+
+async fn post_inventory_missing(
+    State(state): State<AppState>,
+    Json(request): Json<InventoryMissingRequest>,
+) -> Result<Json<InventoryMissingResponse>, AppError> {
+    let requested_object_ids = validate_inventory_object_ids(&request.object_ids)?;
+    let now = now_epoch();
+    let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM bundles
+             WHERE object_id = ?1 AND expires_epoch > ?2",
+        )
+        .map_err(AppError::internal)?;
+
+    let mut needed_object_ids = Vec::new();
+    for object_id in requested_object_ids {
+        let exists = stmt
+            .query_row(params![object_id, now as i64], |_| Ok(()))
+            .optional()
+            .map_err(AppError::internal)?
+            .is_some();
+        if !exists {
+            needed_object_ids.push(object_id);
+        }
+    }
+
+    Ok(Json(InventoryMissingResponse { needed_object_ids }))
 }
 
 async fn get_object(
@@ -512,6 +592,22 @@ fn expire_storage(conn: &Connection) -> rusqlite::Result<()> {
         params![now as i64, stale_cutoff as i64],
     )?;
     Ok(())
+}
+
+fn validate_inventory_object_ids(object_ids: &[String]) -> Result<Vec<String>, AppError> {
+    if object_ids.is_empty() || object_ids.len() > MAX_INVENTORY_OBJECT_IDS {
+        return Err(AppError::bad_request("invalid inventory object count"));
+    }
+
+    let mut seen = HashSet::with_capacity(object_ids.len());
+    let mut validated = Vec::with_capacity(object_ids.len());
+    for object_id in object_ids {
+        validate_hash_string(object_id)?;
+        if seen.insert(object_id.clone()) {
+            validated.push(object_id.clone());
+        }
+    }
+    Ok(validated)
 }
 
 fn validate_profile(profile: &BeaconProfile) -> Result<(), AppError> {
@@ -841,5 +937,94 @@ mod tests {
         let peers: PeerList = serde_json::from_slice(&bytes).expect("peer list");
         assert_eq!(peers.peers.len(), 1);
         assert_eq!(peers.peers[0].node_id, "11".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn recent_inventory_returns_stored_object_ids() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+        let first_bundle = signed_bundle(1);
+        let second_bundle = signed_bundle(2);
+
+        for bundle in [&first_bundle, &second_bundle] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/v1/bundles")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(bundle).expect("serialize bundle"),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/v1/inventory/recent?limit=2")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let inventory: RecentInventoryResponse =
+            serde_json::from_slice(&bytes).expect("inventory body");
+        assert_eq!(inventory.object_ids.len(), 2);
+        assert!(inventory.object_ids.iter().all(|id| id.len() == 64));
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_reports_unknown_objects() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+        let bundle = signed_bundle(1);
+        let accepted = app
+            .clone()
+            .oneshot(
+                axum::http::Request::post("/v1/bundles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&bundle).expect("serialize bundle"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let accepted_bytes = accepted
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let accepted: AcceptedObject =
+            serde_json::from_slice(&accepted_bytes).expect("accepted body");
+        let unknown_id = "ff".repeat(32);
+        let request = InventoryMissingRequest {
+            object_ids: vec![accepted.object_id.clone(), unknown_id.clone(), unknown_id.clone()],
+        };
+
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/v1/inventory/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&request).expect("serialize request"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let missing: InventoryMissingResponse =
+            serde_json::from_slice(&bytes).expect("missing body");
+        assert_eq!(missing.needed_object_ids, vec![unknown_id]);
     }
 }

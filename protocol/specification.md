@@ -38,3 +38,10 @@ Beacon Privacy Network specification.
 - peer announcements are removed once their explicit expiry passes;
 - peers without an explicit expiry are treated as stale after 7 days without a refresh;
 - `GET /v1/peers` only returns non-expired, non-stale peer announcements.
+
+## Inventory synchronization
+
+- `GET /v1/inventory/recent?limit=N` returns a bounded list of recent unexpired object IDs;
+- `POST /v1/inventory/missing` accepts a bounded list of object IDs and returns the subset not currently stored by the relay;
+- duplicate object IDs in missing-object requests are suppressed before lookup;
+- inventory object IDs use the same 32-byte SHA-256 hex encoding as bundle object IDs.
