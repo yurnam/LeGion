@@ -325,7 +325,7 @@ async fn get_recent_inventory(
     State(state): State<AppState>,
     Query(query): Query<RecentInventoryQuery>,
 ) -> Result<Json<RecentInventoryResponse>, AppError> {
-    let limit = query.limit.unwrap_or(32).clamp(1, MAX_INVENTORY_OBJECT_IDS);
+    let limit = validate_inventory_limit(query.limit)?;
     let now = now_epoch();
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
     expire_storage(&conn).map_err(AppError::internal)?;
@@ -608,6 +608,19 @@ fn validate_inventory_object_ids(object_ids: &[String]) -> Result<Vec<String>, A
         }
     }
     Ok(validated)
+}
+
+fn validate_inventory_limit(limit: Option<usize>) -> Result<usize, AppError> {
+    match limit {
+        None => Ok(32),
+        Some(0) | Some(usize::MAX) if MAX_INVENTORY_OBJECT_IDS != usize::MAX => {
+            Err(AppError::bad_request("invalid inventory limit"))
+        }
+        Some(limit) if limit > MAX_INVENTORY_OBJECT_IDS => {
+            Err(AppError::bad_request("invalid inventory limit"))
+        }
+        Some(limit) => Ok(limit),
+    }
 }
 
 fn validate_profile(profile: &BeaconProfile) -> Result<(), AppError> {
@@ -1026,5 +1039,80 @@ mod tests {
         let missing: InventoryMissingResponse =
             serde_json::from_slice(&bytes).expect("missing body");
         assert_eq!(missing.needed_object_ids, vec![unknown_id]);
+    }
+
+    #[tokio::test]
+    async fn recent_inventory_rejects_invalid_limits() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+
+        for uri in [
+            "/v1/inventory/recent?limit=0".to_string(),
+            format!(
+                "/v1/inventory/recent?limit={}",
+                MAX_INVENTORY_OBJECT_IDS + 1
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_rejects_empty_object_ids() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/v1/inventory/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"object_ids":[]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_rejects_invalid_hashes() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/v1/inventory/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"object_ids":["not-a-hash"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn missing_inventory_rejects_unknown_fields() {
+        let state = AppState::new_in_memory().expect("state");
+        let app = app(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::post("/v1/inventory/missing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"object_ids":["ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"],"unexpected":true}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
