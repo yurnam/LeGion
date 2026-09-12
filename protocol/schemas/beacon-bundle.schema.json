@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/beacon-bundle.schema.json",
+  "title": "BeaconBundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "bundle_version",
+    "publisher_node_id",
+    "publisher_public_key",
+    "created_epoch",
+    "expires_epoch",
+    "nonce",
+    "profiles",
+    "metadata",
+    "signature"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "bundle_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "publisher_node_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "publisher_public_key": {
+      "type": "string",
+      "pattern": "^[0-9a-f]+$"
+    },
+    "created_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expires_epoch": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "nonce": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9a-fA-F]+$"
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/beaconProfile"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[0-9a-fA-F]+$"
+    }
+  },
+  "$defs": {
+    "beaconProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "bssid",
+        "ssid",
+        "beacon_interval_tu",
+        "capability_flags",
+        "security_type",
+        "band",
+        "phy_flags",
+        "channel_class",
+        "feature_flags",
+        "source_class"
+      ],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "bssid": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{12}$"
+        },
+        "ssid": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255
+          }
+        },
+        "beacon_interval_tu": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "capability_flags": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "security_type": {
+          "enum": ["open", "wep", "wpa2_personal", "wpa3_personal"]
+        },
+        "band": {
+          "enum": ["ghz2_4", "ghz5"]
+        },
+        "phy_flags": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "channel_class": {
+          "enum": ["non_dfs24", "non_dfs5"]
+        },
+        "vendor_ie_digest": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-fA-F]+$"
+        },
+        "feature_flags": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_class": {
+          "enum": ["synthetic", "consented", "observed_research"]
+        }
+      }
+    }
+  }
+}

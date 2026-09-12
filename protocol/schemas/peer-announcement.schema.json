@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/peer-announcement.schema.json",
+  "title": "PeerAnnouncement",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "node_id",
+    "public_key",
+    "addresses"
+  ],
+  "properties": {
+    "protocol_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "node_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]+$"
+    },
+    "addresses": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "expires_epoch": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "signature": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-fA-F]+$"
+    }
+  }
+}
