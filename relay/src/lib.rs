@@ -98,7 +98,8 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS peers (
             node_id TEXT PRIMARY KEY,
             payload TEXT NOT NULL,
-            last_seen_epoch INTEGER NOT NULL
+            last_seen_epoch INTEGER NOT NULL,
+            expires_epoch INTEGER
         );
         ",
     )?;
