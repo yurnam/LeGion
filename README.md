@@ -10,7 +10,7 @@ This repository currently includes:
 
 - a Rust `privacy-relay` service implementing the temporary bootstrap/relay API;
 - bundle and peer validation with explicit size and schema limits;
-- content-addressed storage backed by SQLite;
+- content-addressed storage backed by SQLite with bundle and peer expiration;
 - protocol documentation and JSON schemas for the relay-facing objects.
 
 ## Relay API

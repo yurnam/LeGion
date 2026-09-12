@@ -31,3 +31,10 @@ Beacon Privacy Network specification.
 6. signature verification;
 7. expiry checks;
 8. storage deduplication by object hash.
+
+## Relay retention behavior
+
+- expired bundles are deleted before read/write operations;
+- peer announcements are removed once their explicit expiry passes;
+- peers without an explicit expiry are treated as stale after 7 days without a refresh;
+- `GET /v1/peers` only returns non-expired, non-stale peer announcements.

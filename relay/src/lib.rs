@@ -36,6 +36,7 @@ pub const MAX_NONCE_HEX_LENGTH: usize = 64;
 pub const MAX_SIGNATURE_HEX_LENGTH: usize = 160;
 pub const MAX_VENDOR_IE_DIGEST_BYTES: usize = 64;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_PEER_STALENESS_SECS: u64 = 60 * 60 * 24 * 7;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -100,7 +101,24 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             last_seen_epoch INTEGER NOT NULL
         );
         ",
-    )
+    )?;
+    ensure_peer_expiry_column(conn)
+}
+
+fn ensure_peer_expiry_column(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(peers)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_expires_epoch = false;
+    for column in columns {
+        if column? == "expires_epoch" {
+            has_expires_epoch = true;
+            break;
+        }
+    }
+    if !has_expires_epoch {
+        conn.execute("ALTER TABLE peers ADD COLUMN expires_epoch INTEGER", [])?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -212,7 +230,7 @@ pub struct AcceptedObject {
     pub stored: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct PeerList {
     pub peers: Vec<PeerAnnouncement>,
 }
@@ -228,6 +246,7 @@ async fn post_bundle(
 ) -> Result<Json<AcceptedObject>, AppError> {
     let validated = ValidatedBundle::from_bundle(bundle)?;
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
     let inserted = conn
         .execute(
             "INSERT OR IGNORE INTO bundles (object_id, payload, publisher_node_id, created_epoch, expires_epoch)
@@ -254,6 +273,7 @@ async fn get_random_bundles(
     let count = query.count.unwrap_or(1).clamp(1, MAX_RANDOM_BUNDLE_COUNT);
     let now = now_epoch();
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
     let mut stmt = conn
         .prepare(
             "SELECT payload FROM bundles
@@ -281,6 +301,7 @@ async fn get_object(
 ) -> Result<Json<BeaconBundle>, AppError> {
     validate_hash_string(&hash)?;
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
     let payload = conn
         .query_row(
             "SELECT payload FROM bundles WHERE object_id = ?1 AND expires_epoch > ?2",
@@ -300,14 +321,16 @@ async fn post_announce(
 ) -> Result<Json<PeerAnnouncement>, AppError> {
     let validated = ValidatedPeerAnnouncement::from_peer(peer)?;
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
     conn.execute(
-        "INSERT INTO peers (node_id, payload, last_seen_epoch)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(node_id) DO UPDATE SET payload = excluded.payload, last_seen_epoch = excluded.last_seen_epoch",
+        "INSERT INTO peers (node_id, payload, last_seen_epoch, expires_epoch)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(node_id) DO UPDATE SET payload = excluded.payload, last_seen_epoch = excluded.last_seen_epoch, expires_epoch = excluded.expires_epoch",
         params![
             validated.node_id,
             validated.payload,
-            validated.last_seen_epoch as i64
+            validated.last_seen_epoch as i64,
+            validated.expires_epoch.map(|epoch| epoch as i64)
         ],
     )
     .map_err(AppError::internal)?;
@@ -315,16 +338,24 @@ async fn post_announce(
 }
 
 async fn get_peers(State(state): State<AppState>) -> Result<Json<PeerList>, AppError> {
+    let now = now_epoch();
+    let stale_cutoff = now.saturating_sub(MAX_PEER_STALENESS_SECS);
     let conn = state.db.lock().map_err(|_| AppError::internal("db lock"))?;
+    expire_storage(&conn).map_err(AppError::internal)?;
     let mut stmt = conn
         .prepare(
             "SELECT payload FROM peers
+             WHERE (expires_epoch IS NULL OR expires_epoch > ?1)
+               AND last_seen_epoch > ?2
              ORDER BY last_seen_epoch DESC
-             LIMIT ?1",
+             LIMIT ?3",
         )
         .map_err(AppError::internal)?;
     let rows = stmt
-        .query_map(params![MAX_PEER_COUNT as i64], |row| row.get::<_, String>(0))
+        .query_map(
+            params![now as i64, stale_cutoff as i64, MAX_PEER_COUNT as i64],
+            |row| row.get::<_, String>(0),
+        )
         .map_err(AppError::internal)?;
     let peers = rows
         .map(|row| {
@@ -408,6 +439,7 @@ struct ValidatedPeerAnnouncement {
     payload: String,
     node_id: String,
     last_seen_epoch: u64,
+    expires_epoch: Option<u64>,
 }
 
 impl ValidatedPeerAnnouncement {
@@ -458,8 +490,25 @@ impl ValidatedPeerAnnouncement {
             payload,
             node_id,
             last_seen_epoch: now_epoch(),
+            expires_epoch: peer.expires_epoch,
         })
     }
+}
+
+fn expire_storage(conn: &Connection) -> rusqlite::Result<()> {
+    let now = now_epoch();
+    let stale_cutoff = now.saturating_sub(MAX_PEER_STALENESS_SECS);
+    conn.execute(
+        "DELETE FROM bundles WHERE expires_epoch <= ?1",
+        params![now as i64],
+    )?;
+    conn.execute(
+        "DELETE FROM peers
+         WHERE (expires_epoch IS NOT NULL AND expires_epoch <= ?1)
+            OR last_seen_epoch <= ?2",
+        params![now as i64, stale_cutoff as i64],
+    )?;
+    Ok(())
 }
 
 fn validate_profile(profile: &BeaconProfile) -> Result<(), AppError> {
@@ -596,6 +645,7 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use p256::ecdsa::{SigningKey, signature::Signer};
+    use rusqlite::params;
     use tower::ServiceExt;
 
     fn signed_bundle(profile_count: usize) -> BeaconBundle {
@@ -701,5 +751,92 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(object_response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn expire_storage_removes_expired_bundles_and_stale_peers() {
+        let state = AppState::new_in_memory().expect("state");
+        let conn = state.db.lock().expect("db lock");
+        let bundle = signed_bundle(1);
+        conn.execute(
+            "INSERT INTO bundles (object_id, payload, publisher_node_id, created_epoch, expires_epoch)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "aa".repeat(32),
+                serde_json::to_string(&bundle).expect("bundle json"),
+                bundle.publisher_node_id,
+                1_i64,
+                (now_epoch().saturating_sub(1)) as i64
+            ],
+        )
+        .expect("insert bundle");
+        conn.execute(
+            "INSERT INTO peers (node_id, payload, last_seen_epoch, expires_epoch)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                "bb".repeat(32),
+                r#"{"protocol_version":1,"node_id":"bb"}"#,
+                (now_epoch().saturating_sub(MAX_PEER_STALENESS_SECS + 1)) as i64,
+                Option::<i64>::None
+            ],
+        )
+        .expect("insert peer");
+
+        expire_storage(&conn).expect("expire storage");
+
+        let bundle_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bundles", [], |row| row.get(0))
+            .expect("bundle count");
+        let peer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))
+            .expect("peer count");
+        assert_eq!(bundle_count, 0);
+        assert_eq!(peer_count, 0);
+    }
+
+    #[tokio::test]
+    async fn get_peers_filters_stale_entries() {
+        let state = AppState::new_in_memory().expect("state");
+        {
+            let conn = state.db.lock().expect("db lock");
+            conn.execute(
+                "INSERT INTO peers (node_id, payload, last_seen_epoch, expires_epoch)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "11".repeat(32),
+                    r#"{"protocol_version":1,"node_id":"1111111111111111111111111111111111111111111111111111111111111111","public_key":"04aa","addresses":["https://relay.example"]}"#,
+                    now_epoch() as i64,
+                    Option::<i64>::None
+                ],
+            )
+            .expect("insert fresh peer");
+            conn.execute(
+                "INSERT INTO peers (node_id, payload, last_seen_epoch, expires_epoch)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    "22".repeat(32),
+                    r#"{"protocol_version":1,"node_id":"2222222222222222222222222222222222222222222222222222222222222222","public_key":"04bb","addresses":["https://expired.example"]}"#,
+                    (now_epoch().saturating_sub(MAX_PEER_STALENESS_SECS + 1)) as i64,
+                    Option::<i64>::None
+                ],
+            )
+            .expect("insert stale peer");
+        }
+        let app = app(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/v1/peers")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let peers: PeerList = serde_json::from_slice(&bytes).expect("peer list");
+        assert_eq!(peers.peers.len(), 1);
+        assert_eq!(peers.peers[0].node_id, "11".repeat(32));
     }
 }
